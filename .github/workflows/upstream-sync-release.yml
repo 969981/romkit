@@ -1,0 +1,216 @@
+# Automatically mirror platinvm/romkit and publish build snapshots to this repository only.
+# Do not push upstream v* tags: the original release.yml publishes to crates.io.
+name: Sync upstream and release
+
+on:
+  schedule:
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: romkit-upstream-sync-and-release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sync:
+    name: Sync platinvm/romkit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      changed: ${{ steps.sync.outputs.changed }}
+      commit: ${{ steps.sync.outputs.commit }}
+      upstream: ${{ steps.sync.outputs.upstream }}
+      tag: ${{ steps.sync.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+      - name: Fetch, compare and merge upstream
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/platinvm/romkit.git
+          git fetch --no-tags upstream main
+          upstream_sha=$(git rev-parse upstream/main)
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Up to date with platinvm/romkit at $upstream_sha"
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Do not force-push or overwrite mirror-specific automation. A conflict
+          # fails visibly and can be resolved without losing either side.
+          git merge --no-ff -m "chore(sync): upstream $upstream_sha" upstream/main
+          commit=$(git rev-parse HEAD)
+          git push origin HEAD:main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "upstream=$upstream_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=sync-${upstream_sha:0:12}" >> "$GITHUB_OUTPUT"
+          echo "Synced upstream $upstream_sha as $commit"
+
+  check:
+    name: Verify synced source
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.commit }}
+      - name: Install Rust and wasm target
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
+          rustup default stable
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy -p romkit-wasm --target wasm32-unknown-unknown --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  cli:
+    name: CLI / ${{ matrix.target }}
+    needs: [sync, check]
+    if: needs.sync.outputs.changed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-24.04-arm }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: aarch64-pc-windows-msvc, os: windows-11-arm }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      NAME: romkit-${{ needs.sync.outputs.tag }}-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.commit }}
+      - name: Install target
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+          rustup default stable
+      - name: Compile CLI
+        run: cargo build --release --locked -p romkit-cli --target ${{ matrix.target }}
+      - name: Package Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir "$NAME"
+          cp "target/${{ matrix.target }}/release/romkit" README.md LICENSE-MIT LICENSE-APACHE "$NAME/"
+          tar -czf "$NAME.tar.gz" "$NAME"
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory $env:NAME
+          Copy-Item "target/${{ matrix.target }}/release/romkit.exe", README.md, LICENSE-MIT, LICENSE-APACHE $env:NAME
+          Compress-Archive $env:NAME "$env:NAME.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: ${{ env.NAME }}.*
+          if-no-files-found: error
+          retention-days: 7
+
+  wasm:
+    name: WebAssembly
+    needs: [sync, check]
+    if: needs.sync.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      NAME: romkit-wasm-${{ needs.sync.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.commit }}
+      - name: Install target
+        run: |
+          rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+          rustup default stable
+      - run: cargo build --release --locked -p romkit-wasm --target wasm32-unknown-unknown
+      - name: Package wasm and JS loader
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir "$NAME"
+          cp target/wasm32-unknown-unknown/release/romkit_wasm.wasm "$NAME/romkit.wasm"
+          cp crates/romkit-wasm/romkit.mjs LICENSE-MIT LICENSE-APACHE "$NAME/"
+          tar -czf "$NAME.tar.gz" "$NAME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: ${{ env.NAME }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish mirror snapshot
+    needs: [sync, check, cli, wasm]
+    if: >-
+      needs.sync.outputs.changed == 'true' &&
+      needs.check.result == 'success' &&
+      needs.cli.result == 'success' &&
+      needs.wasm.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download all build packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Verify asset count and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(find dist -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l)" -eq 7
+          (cd dist && sha256sum *.tar.gz *.zip > SHA256SUMS)
+          cat dist/SHA256SUMS
+      - name: Publish once per upstream revision (GitHub only)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.sync.outputs.tag }}
+          SHA: ${{ needs.sync.outputs.commit }}
+          UPSTREAM: ${{ needs.sync.outputs.upstream }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; not republishing."
+            exit 0
+          fi
+          cat > release-notes.md <<EOF
+          Automated GitHub-only romkit snapshot.
+
+          - Upstream: [platinvm/romkit](https://github.com/platinvm/romkit)
+          - Upstream revision: \`$UPSTREAM\`
+          - Mirror build revision: \`$SHA\`
+          - GitHub Actions run: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          - Includes six native CLI archives, one WebAssembly archive, and SHA256SUMS.
+
+          This is a prerelease snapshot. It does **not** publish crates to crates.io.
+          EOF
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --title "romkit upstream ${UPSTREAM:0:12}" \
+            --notes-file release-notes.md \
+            --prerelease
